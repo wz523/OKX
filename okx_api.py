@@ -38,6 +38,17 @@ import random
 log = logging.getLogger("GVWAP")
 SEED_HEX = os.getenv("CLORD_SEED") or f"{random.getrandbits(32):08x}"
 
+
+# --- clOrdId 唯一化工具 ---
+_CL_COUNTER = 0
+def _b36(n: int, width: int = 6) -> str:
+    s = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    out = []
+    for _ in range(width):
+        out.append(s[n % 36]); n //= 36
+    return "".join(reversed(out))
+
+
 def _make_clordid(instId: str, side: str, px, sz, tag: str | None) -> str | None:
     """Deterministic idempotency key. Max 32 chars for OKX clOrdId."""
     try:
@@ -349,3 +360,73 @@ def fetch_order_by_clordid(instId: str, clOrdId: str) -> Dict[str, Any]:
     jd = _req("GET", "/api/v5/trade/order", params={"instId": instId, "clOrdId": clOrdId}, private=True)
     arr = jd.get("data", []) if isinstance(jd, dict) else []
     return arr[0] if arr else {}
+
+
+
+def _make_clordid(instId: str, side: str, px, sz, tag: str | None) -> str | None:
+    """Unique but short. Keep <=32 chars for OKX."""
+    try:
+        global _CL_COUNTER
+        _CL_COUNTER = (_CL_COUNTER + 1) % (36**6)  # rolling counter
+        base = f"{instId}|{side}|{px}|{sz}|{tag}|{SEED_HEX}"
+        h = hashlib.sha1(base.encode()).hexdigest()[:16]  # 16 hex
+        suf = _b36(_CL_COUNTER, 6)                        # 6 chars
+        return f"G{h}{suf}".upper()                      # len=23
+    except Exception:
+        return None
+
+
+
+
+def place_limit(instId: str, side: str, sz: Decimal, px: Decimal,
+                post_only: bool = True, reduce_only: bool = False, tag: str | None = None,
+                posSide: str | None = None, td_mode: str | None = None) -> str:
+    def _try_once(new_id: bool):
+        clid = _make_clordid(instId, side, px, sz, tag) if new_id else clid0
+        body = {
+            "instId": instId, "tdMode": (td_mode or TD_MODE_DEFAULT),
+            "side": side, "posSide": (posSide or _posSide_from_side(side)),
+            "ordType": "post_only" if post_only else "limit",
+            "px": str(px), "sz": str(sz), "tag": tag,
+            "clOrdId": clid, "reduceOnly": "true" if reduce_only else "false",
+        }
+        jd = _req("POST", "/api/v5/trade/order", body=body, private=True)
+        data = jd.get("data", []) if isinstance(jd, dict) else []
+        if data and data[0].get("ordId"):
+            return data[0]["ordId"]
+        od = fetch_order_by_clordid(instId, clid)
+        st = str(od.get("state", "")).lower()
+        if od.get("ordId") and st not in {"canceled", "filled"}:
+            return od.get("ordId", "")
+        return ""
+
+    clid0 = _make_clordid(instId, side, px, sz, tag)
+    return _try_once(False) or _try_once(True)
+
+
+
+
+def place_market(instId: str, side: str, sz: Decimal,
+                 reduce_only: bool = False, tag: str | None = None,
+                 posSide: str | None = None, td_mode: str | None = None) -> str:
+    def _try_once(new_id: bool):
+        clid = _make_clordid(instId, side, "MKT", sz, tag) if new_id else clid0
+        body = {
+            "instId": instId, "tdMode": (td_mode or TD_MODE_DEFAULT),
+            "side": side, "posSide": (posSide or _posSide_from_side(side)),
+            "ordType": "market", "sz": str(sz), "tag": tag, "clOrdId": clid,
+            "reduceOnly": "true" if reduce_only else "false",
+        }
+        jd = _req("POST", "/api/v5/trade/order", body=body, private=True)
+        data = jd.get("data", []) if isinstance(jd, dict) else []
+        if data and data[0].get("ordId"):
+            return data[0]["ordId"]
+        od = fetch_order_by_clordid(instId, clid)
+        st = str(od.get("state", "")).lower()
+        if od.get("ordId") and st not in {"canceled", "filled"}:
+            return od.get("ordId", "")
+        return ""
+
+    clid0 = _make_clordid(instId, side, "MKT", sz, tag)
+    return _try_once(False) or _try_once(True)
+

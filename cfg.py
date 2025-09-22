@@ -142,6 +142,11 @@ TREND_COOLDOWN_SEC = 180  # 信号之间无冷却# 信号之间无冷却
 TREND_MAX_NOTIONAL_USD = Decimal("0")  # 不限制总趋势名义
 
 TREND_MIN_DISTANCE_PCT = Decimal("0.008")  # 每次趋势加仓与上一次的最小价格距离比例
+
+# 趋势动量与二次确认
+TREND_MOMENTUM_ALPHA = Decimal("1.2")   # 1m MACD直方图强度需≥近N根平均的α倍
+TREND_MOMENTUM_WINDOW = 20              # N 根
+TREND_REQUIRE_TWO_BARS = True           # 需要最近2根1m直方图同向
 # 保留旧字段以兼容历史读取，但不再使用
 TREND_USE_TARGET = True
 TREND_TARGET_USD_LONG = TREND_NOTIONAL_USD
@@ -186,6 +191,11 @@ CONFIRM_FILL_TIMEOUT_MS = 4000
 # --- DCA（亏损方向加仓） ---
 # 当亏损区间在 DCA_MIN_PCT~DCA_MAX_PCT 之间时，启动 DCA 窗口。
 # DCA_FIXED_NOTIONAL_USD 定义每次加仓的名义美元，DCA_TOTAL_CAP 控制单侧最多加仓次数。
+# DCA 动量与二次确认
+DCA_MOMENTUM_ALPHA = Decimal("1.2")
+DCA_MOMENTUM_WINDOW = 20
+DCA_REQUIRE_TWO_BARS = True
+
 DCA_ENABLE = True
 # 未使用 DCA_MIN_DIST_TO_LIQ_PCT（旧逻辑）
 DCA_MIN_PCT = Decimal("0.08")      # 启动 DCA 的最小亏损百分比

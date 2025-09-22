@@ -187,13 +187,8 @@ def _cross_last(hist: List[float]) -> str | None:
     return None
 
 def dca_reverse_signal(instId: str, side: str) -> bool:
-    """
-    side: 'long' 或 'short'
-    条件：
-      - 1m MACD 直方图最近一根发生跨零穿越（golden/death）
-      - 且价格相对 1m VWAP 同向确认（long: last>=vwap；short: last<=vwap）
-      - 且 5m/15m 不出现“强反对”（不同时同向反对）
-    """
+    # DCA触发：1m刚跨零 + VWAP同向 + 5m/15m同向支持
+    # 新增：动量闸门 + 二次确认（跨零后等2根1m收盘仍同向）
     try:
         k1 = _fetch_kl_compat(instId, "1m", 200)
         k5 = _fetch_kl_compat(instId, "5m", 200)
@@ -208,15 +203,71 @@ def dca_reverse_signal(instId: str, side: str) -> bool:
         last_px = closes1[-1] if closes1 else vwap_px
         h5 = _macd_last_hist(closes5)
         h15 = _macd_last_hist(closes15)
+        hist5 = _macd_hist_series(closes5)
+        hist15 = _macd_hist_series(closes15)
+        cross5 = _cross_last(hist5)
+        cross15 = _cross_last(hist15)
         if side == "long":
             cond_cross = (cross == "golden")
+            # 二次确认：[-3]<0 且 [-2]>0 且 [-1]>0
+            cond_two = bool(len(hist1) >= 3 and hist1[-3] < 0 and hist1[-2] > 0 and hist1[-1] > 0)
             cond_vwap = (last_px >= vwap_px)
-            # 5/15m 不同时为看空
-            ok_multi = not (h5 < 0 and h15 < 0)
+            ok_multi = ((h5 > 0 and h15 > 0) or (cross5 == "golden" and cross15 == "golden"))
         else:
             cond_cross = (cross == "death")
+            # 二次确认：[-3]>0 且 [-2]<0 且 [-1]<0
+            cond_two = bool(len(hist1) >= 3 and hist1[-3] > 0 and hist1[-2] < 0 and hist1[-1] < 0)
             cond_vwap = (last_px <= vwap_px)
-            ok_multi = not (h5 > 0 and h15 > 0)
-        return bool(cond_cross and cond_vwap and ok_multi)
+            ok_multi = ((h5 < 0 and h15 < 0) or (cross5 == "death" and cross15 == "death"))
+        # 动量闸门
+        try:
+            from cfg import DCA_MOMENTUM_ALPHA, DCA_MOMENTUM_WINDOW, DCA_REQUIRE_TWO_BARS
+        except Exception:
+            DCA_MOMENTUM_ALPHA, DCA_MOMENTUM_WINDOW, DCA_REQUIRE_TWO_BARS = 1.2, 20, True
+        mom_ok = _momentum_gate(hist1, float(DCA_MOMENTUM_ALPHA), int(DCA_MOMENTUM_WINDOW))
+        two_ok = (cond_two if DCA_REQUIRE_TWO_BARS else True)
+        return bool(cond_cross and cond_vwap and ok_multi and mom_ok and two_ok)
     except Exception:
         return False
+
+
+
+def _momentum_gate(hist: List[float], alpha: float, window: int) -> bool:
+    if not hist:
+        return False
+    w = max(1, int(window))
+    arr = [abs(x) for x in hist[-w:]] if len(hist) >= w else [abs(x) for x in hist]
+    base = sum(arr) / float(len(arr)) if arr else 0.0
+    cur = abs(hist[-1])
+    if base <= 0:
+        return False
+    return bool(cur >= alpha * base)
+
+def _two_bar_same_side(hist: List[float], side: str) -> bool:
+    if len(hist) < 2:
+        return False
+    if side == "long":
+        return bool(hist[-1] > 0 and hist[-2] > 0)
+    else:
+        return bool(hist[-1] < 0 and hist[-2] < 0)
+
+def trend_filters_ok(instId: str, side: str) -> bool:
+    # 用于趋势加仓的动量闸门 + 二次确认（1m MACD直方图）
+    # - 动量：|hist[-1]| ≥ α × mean(|hist[-N:]|)
+    # - 二次确认：最近2根1m直方图同向
+    # 参数来自 cfg：TREND_MOMENTUM_ALPHA, TREND_MOMENTUM_WINDOW, TREND_REQUIRE_TWO_BARS
+    try:
+        from cfg import TREND_MOMENTUM_ALPHA, TREND_MOMENTUM_WINDOW, TREND_REQUIRE_TWO_BARS
+    except Exception:
+        TREND_MOMENTUM_ALPHA, TREND_MOMENTUM_WINDOW, TREND_REQUIRE_TWO_BARS = 1.2, 20, True
+    k1 = _fetch_kl_compat(instId, "1m", 200)
+    k1 = list(reversed(k1))
+    closes1 = [_to_float(x[4]) for x in k1]
+    hist1 = _macd_hist_series(closes1)
+    mom_ok = _momentum_gate(hist1, float(TREND_MOMENTUM_ALPHA), int(TREND_MOMENTUM_WINDOW))
+    if not mom_ok:
+        return False
+    if TREND_REQUIRE_TWO_BARS:
+        if not _two_bar_same_side(hist1, side):
+            return False
+    return True

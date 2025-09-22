@@ -11,7 +11,7 @@ from market import Market
 from account import Account
 from grid_sys import Grid
 from risk_sys import MarginGuard
-from indicators import resonance
+from indicators import resonance, trend_filters_ok
 from cfg import log_action
 
 log = logging.getLogger("GVWAP")
@@ -41,6 +41,9 @@ class Strategy:
         self.last_trend_ts_short = 0.0
         self.last_trend_px_long = None
         self.last_trend_px_short = None
+        # 趋势按自然日计数的日期键
+        self._trend_day = time.strftime('%Y-%m-%d', time.localtime())
+
 
     def takeover_positions(self):
         # 直接读取当前持仓（要求 .env 配置正确）
@@ -188,6 +191,11 @@ class Strategy:
         log_action("dca.check")
         if not getattr(cfg, "DCA_ENABLE", True):
             return
+        # 风控暂停则不执行DCA
+        if hasattr(self, 'guard') and getattr(self.guard, 'paused', False):
+            log_action('dca.blocked', reason='guard_paused')
+            return
+
         try:
             px = Decimal(str(self.acc.mkt.px()))
         except Exception:
@@ -227,19 +235,22 @@ class Strategy:
                     lots_str = self._notional_to_lots(usd)
                     lots = Decimal(str(lots_str))
                     if lots > 0:
-                        self.acc.place_order(
-                            "buy" if side == "long" else "sell",
-                            lots,
-                            px=None,
-                            reduce_only=False,
-                            tag="DCA",
-                            posSide=side,
-                        )
-                        if side == "long":
-                            self.dca_used_long += 1
+                        if hasattr(self.guard, "paused") and self.guard.paused:
+                            log.warning("[DCA阻断] 风控暂停，跳过下单 side=%s lots=%s", side, lots_str)
                         else:
-                            self.dca_used_short += 1
-                        log.info("[DCA执行] side=%s loss=%.2f%% lots=%s", side, float(loss * 100), lots_str)
+                            self.acc.place_order(
+                                "buy" if side == "long" else "sell",
+                                lots,
+                                px=None,
+                                reduce_only=False,
+                                tag="DCA",
+                                posSide=side,
+                            )
+                            if side == "long":
+                                self.dca_used_long += 1
+                            else:
+                                self.dca_used_short += 1
+                            log.info("[DCA执行] side=%s loss=%.2f%% lots=%s", side, float(loss * 100), lots_str)
                 # 离开窗口：价格回到均价或盈利
                 pos2 = self.acc.get_positions()
                 p2 = pos2.get(side, {})
@@ -270,6 +281,13 @@ class Strategy:
             # 风控暂停则不加仓
             if hasattr(self.guard, "paused") and self.guard.paused:
                 return
+            # 自然日切换时重置每日计数
+            _today = time.strftime('%Y-%m-%d', time.localtime())
+            if getattr(self, '_trend_day', None) != _today:
+                self._trend_day = _today
+                self.trend_daily_count_long = 0
+                self.trend_daily_count_short = 0
+
             pos = self.acc.get_positions()
             _lp = Decimal(str(pos.get("long", {}).get("pos", 0)))
             _sp = Decimal(str(pos.get("short", {}).get("pos", 0)))
@@ -289,6 +307,14 @@ class Strategy:
                     want = bool(sig.get("bear") and sig.get("vol_bear"))
                 if not want:
                     continue
+                # 动量闸门 + 二次确认
+                try:
+                    _ok = trend_filters_ok(self.inst, side)
+                except Exception:
+                    _ok = False
+                if not _ok:
+                    continue
+
                 # DCA 窗口内不加仓
                 if getattr(self, f"in_dca_{side}", False):
                     continue
@@ -441,11 +467,12 @@ class Strategy:
                 self.grid.place_missing()
                 # 吃满一侧→在当前价格重建（近似“最后成交价”）
                 live_b, live_s = self.grid.side_live_counts()
-                if live_b == 0 or live_s == 0:
+                if getattr(self.grid, "_had_full_live", False) and (live_b + live_s) > 0 and (live_b == 0 or live_s == 0) and (time.time() - getattr(self, "last_rebuild_ts", 0) >= getattr(cfg, "REBUILD_COOLDOWN_SEC", 12)):
                     cen = Decimal(str(mkt.px()))
                     if hasattr(self.acc, "last_fill_px") and self.acc.last_fill_px:
                         cen = Decimal(str(self.acc.last_fill_px))
                     log.info("一侧吃满→重建网格：center=%.2f", float(cen), extra={"event":"grid.rebuild.trigger","reason":"one_side_empty","center":float(cen)})
+                    self.last_rebuild_ts = time.time()
                     self.grid.cancel_all_grid_orders()
                     self.grid.rebuild(center=cen)
                     self.grid.place_all()
