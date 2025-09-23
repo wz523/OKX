@@ -96,19 +96,27 @@ class Account:
 
     def live_grid_prices(self) -> List[Decimal]:
         """返回当前存活的 GRID 挂单价位（识别 tag 或 clOrdId 前缀）"""
+        raw_orders = fetch_open_orders(self.inst)
+        log.warning("[DEBUG] fetch_open_orders 返回原始订单数: %s", len(raw_orders))
         prices = []
-        for o in fetch_open_orders(self.inst):
+        for o in raw_orders:
             tag = (o.get("tag") or o.get("clOrdId") or "").upper()
+            log.warning("[DEBUG] 订单ID=%s, tag=%s", o.get("ordId"), tag)
             if "GRID" in tag:
                 try:
                     prices.append(to_decimal(o.get("px", 0)))
                 except Exception:
                     pass
+        log.warning("[DEBUG] 识别为 GRID 的价位: %s", prices)
         return prices
 
     # ===== 下/撤单封装 =====
     def place_order(self, side: str, sz: Decimal, px: Decimal | None, reduce_only: bool, tag: str, posSide: str | None = None) -> str:
         """返回 orderId（由 okx_api 实现）"""
+        # --------- 新增：风控暂停拦截 ---------
+        if getattr(self, "_risk_guard", None) and getattr(self._risk_guard, "paused", False):
+            raise RuntimeError("RiskGuard paused – order rejected")
+        # -------------------------------------
         # 市价单直接走 market
         if px is None:
             return place_market(self.inst, side, sz, reduce_only=reduce_only, td_mode=self.td_mode, tag=tag, posSide=posSide)

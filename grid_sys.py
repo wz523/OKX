@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 """网格系统（重建/挂单/撤单/自修复）
 - 动态读取 cfg：grid_step_usd / grid_levels_per_side / recenter_pct 等
@@ -123,7 +122,9 @@ class Grid:
         sz_aligned = align_size(sz, lot, min_sz)
         if sz_aligned <= 0:
             return None
-        oid = self.acc.place_order(side, sz_aligned, px, reduce_only=False, tag="GRID",
+        # 对齐价格到 tick，避免 51006
+        px_aligned = self._effective_limit_px(side, px)
+        oid = self.acc.place_order(side, sz_aligned, px_aligned, reduce_only=False, tag="GRID",
                                    posSide=("long" if side == "buy" else "short"))
         return oid
 
@@ -148,7 +149,7 @@ class Grid:
                 placed += 1
 
         if placed:
-            log.info("已按当前网格挂单：buy=%d sell=%d", 
+            log.info("已按当前网格挂单：buy=%d sell=%d",
                      sum(1 for px, _ in self.buy_lv if self._effective_limit_px("buy", px) in self._live_set()),
                      sum(1 for px, _ in self.sell_lv if self._effective_limit_px("sell", px) in self._live_set()))
             log_action("grid.place_all", placed=int(placed))
@@ -169,7 +170,6 @@ class Grid:
         except Exception as e:
             log.warning("撤掉网格单失败：%s", e)
             return 0
-
 
     def _update_flat_edges(self):
         """检测从有仓→全平的边沿，用于整侧补挂"""
@@ -246,13 +246,9 @@ class Grid:
     def place_missing(self):
         """按规则补齐缺失价位。"""
         # 停用时尊重 pause 标志
-        if getattr(self.acc, "pause_long", False) or getattr(self.acc, "pause_short", False):
-            # 仍允许另一侧工作，分别判断
-            pass
-
         live_set = self._live_set()
         now_ts = time.time()
-        now_px = Decimal(str(self.acc.mkt.px()))
+        now_px = Decimal(str(self.acc.mkt.refresh_mid()))
 
         # 平仓边沿检测与整侧补
         self._update_flat_edges()
@@ -281,7 +277,7 @@ class Grid:
                     self._missing_since.pop(px_cmp, None)
                     continue
 
-                # 节流：侧暂停时跳过
+                # 节流：侧暂停时跳过——必须把 continue 放在 pop 之后
                 if side == "long" and getattr(self.acc, "pause_long", False):
                     continue
                 if side == "short" and getattr(self.acc, "pause_short", False):

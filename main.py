@@ -42,6 +42,12 @@ def run_once():
     inst_id = os.getenv("INST_ID","ETH-USDT-SWAP")
     td_mode = os.getenv("TD_MODE","cross")
     log.info("策略启动 - 合约: %s | 持仓模式: %s", inst_id, td_mode)
+
+    # ✅ 启动时清空所有历史挂单（防止干扰）
+    from okx_api import cancel_all
+    canceled = cancel_all(inst_id)
+    log.warning("[启动] 已清空 %d 条历史挂单，防止干扰", canceled)
+
     run_strategy_once(inst_id=inst_id, td_mode=td_mode)
 
 def run_daemon():

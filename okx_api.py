@@ -36,8 +36,7 @@ import requests
 import random
 
 log = logging.getLogger("GVWAP")
-SEED_HEX = os.getenv("CLORD_SEED") or f"{random.getrandbits(32):08x}"
-
+SEED_HEX = f"{random.getrandbits(64):016x}_{int(time.time() * 1000)}"
 
 # --- clOrdId 唯一化工具 ---
 _CL_COUNTER = 0
@@ -48,6 +47,16 @@ def _b36(n: int, width: int = 6) -> str:
         out.append(s[n % 36]); n //= 36
     return "".join(reversed(out))
 
+
+def _make_clordid(instId: str, side: str, px, sz, tag: str | None) -> str | None:
+    """每次启动都生成唯一的 clOrdId，避免 51016"""
+    try:
+        ts = int(time.time() * 1000)  # 毫秒级时间戳
+        key = f"{instId}|{side}|{px}|{sz}|{tag}|{SEED_HEX}|{ts}"
+        h = hashlib.sha1(key.encode()).hexdigest()[:20]
+        return f"G{h}".upper()
+    except Exception:
+        return None
 
 
 # ---- auto-load .env (project root / module dir / parent) ----
@@ -144,7 +153,7 @@ def _sign(ts: str, method: str, path: str, body: str) -> str:
 def _req(method: str, path: str, params: Dict[str, Any] | None = None, body: Dict[str, Any] | None = None, private: bool = False) -> Dict:
     url = f"{BASE_URL}{path}"
     body_str = "" if (body is None) else __import__("json").dumps(body, separators=(",", ":"))
-    headers = {}
+    headers: Dict[str, str] = {}
     if private:
         if not (API_KEY and API_SECRET and API_PASSPHRASE):
             raise RuntimeError("未配置 OKX API 三件套，无法调用私有接口")
@@ -161,19 +170,38 @@ def _req(method: str, path: str, params: Dict[str, Any] | None = None, body: Dic
     for _ in range(3):
         try:
             if method.upper() == "GET":
-                r = SESSION.get(url, params=params, headers=headers, timeout=TIMEOUT, proxies=_get_proxies(url))
+                r = SESSION.get(url, params=params, headers=headers, timeout=TIMEOUT)
             else:
-                r = SESSION.post(url, params=params, data=body_str.encode(), headers=headers, timeout=TIMEOUT, proxies=_get_proxies(url))
+                r = SESSION.post(url, params=params, data=body_str.encode(), headers=headers, timeout=TIMEOUT)
             if r.status_code // 100 != 2:
                 raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
             jd = r.json()
+            # Check error codes returned by OKX. If code is not 0 or None, raise a descriptive error.
             if jd.get("code") not in ("0", 0, None):
+                # Attempt to assemble human readable details for the first few error entries.
                 data = jd.get('data') or []
-                detail = '; '.join([f"{x.get('sCode') or x.get('code')}: {x.get('sMsg') or x.get('msg')}" for x in data][:3])
-            # Special-case: order not exist when querying by clOrdId
-            if str(jd.get("code")) == "51603" and path == "/api/v5/trade/order":
-                return {}
-            raise RuntimeError(f"OKX错误: code={jd.get('code')} msg={jd.get('msg')} details=[{detail}]")
+                detail = ""
+                try:
+                    if isinstance(data, list):
+                        parts: List[str] = []
+                        for x in data[:3]:
+                            # Guard against non-dict elements and missing keys.
+                            if isinstance(x, dict):
+                                code_val = x.get('sCode') or x.get('code') or ''
+                                msg_val = x.get('sMsg') or x.get('msg') or ''
+                                parts.append(f"{code_val}: {msg_val}")
+                            else:
+                                parts.append(str(x))
+                        detail = '; '.join(parts)
+                    else:
+                        detail = str(data)
+                except Exception:
+                    detail = str(data)
+                # Raise an exception with aggregated details if available.
+                raise RuntimeError(
+                    f"OKX错误: code={jd.get('code')} msg={jd.get('msg')} " +
+                    (f"details=[{detail}]" if detail else "")
+                )
             return jd
         except Exception as e:
             err = str(e)
@@ -183,21 +211,6 @@ def _req(method: str, path: str, params: Dict[str, Any] | None = None, body: Dic
     return {}
 
 
-
-
-def fetch_price_limit(instId: str) -> dict:
-    """Get OKX price limit band for the instrument. Return {'maxBuy': Decimal, 'minSell': Decimal}."""
-    jd = _req("GET", "/api/v5/public/price-limit", params={"instId": instId})
-    try:
-        arr = jd.get("data", [])
-        d = arr[0] if arr else {}
-        max_buy = d.get("buyLmt") or d.get("maxBuy") or d.get("highest")
-        min_sell = d.get("sellLmt") or d.get("minSell") or d.get("lowest")
-        from decimal import Decimal
-        return {"maxBuy": Decimal(str(max_buy or "0")), "minSell": Decimal(str(min_sell or "0"))}
-    except Exception:
-        from decimal import Decimal
-        return {"maxBuy": Decimal("0"), "minSell": Decimal("0")}
 # ========== 公共接口 ==========
 
 def fetch_instrument(instId: str) -> Dict[str, str]:
@@ -235,6 +248,7 @@ def fetch_positions(instId: str) -> List[Dict[str, Any]]:
 
 def fetch_open_orders(instId: str) -> List[Dict[str, Any]]:
     jd = _req("GET", "/api/v5/trade/orders-pending", params={"instType": "SWAP", "instId": instId}, private=True)
+    log.warning("[DEBUG] fetch_open_orders 原始返回: %s", jd)
     return jd.get("data", [])
 
 
@@ -296,18 +310,6 @@ def place_market(instId: str, side: str, sz: Decimal,
     }
     if body.get("clOrdId") is None:
         body.pop("clOrdId", None)
-    # clamp to price band to avoid 51006
-    try:
-        band = fetch_price_limit(instId)
-        if str(side).lower() == "buy" and band.get("maxBuy"):
-            if px > band["maxBuy"]:
-                px = band["maxBuy"]
-        if str(side).lower() == "sell" and band.get("minSell"):
-            if px < band["minSell"]:
-                px = band["minSell"]
-    except Exception:
-        pass
-
     try:
         jd = _req("POST", "/api/v5/trade/order", body=body, private=True)
         data = jd.get("data", [])
@@ -338,9 +340,10 @@ def cancel_all(instId: str) -> int:
     return cnt
 
 
-def close_position(instId: str, td_mode: str = None) -> None:
+def close_position(instId: str, td_mode: str = None, *, posSide: str = None) -> None:
     # 统一使用 close-position API，分别对 long/short 侧提交
-    for posSide in ("long", "short"):
+    sides = (posSide,) if posSide else ("long", "short")
+    for posSide in sides:
         body = {"instId": instId, "posSide": posSide, "mgnMode": TD_MODE_DEFAULT if (td_mode or TD_MODE_DEFAULT) == "cross" else "isolated"}
         try:
             _req("POST", "/api/v5/trade/close-position", body=body, private=True)
@@ -369,7 +372,7 @@ def _get_proxies(url: str):
             return None
         http = os.environ.get('HTTP_PROXY')
         https = os.environ.get('HTTPS_PROXY')
-        proxies = {}
+        proxies: Dict[str, str] = {}
         if http: proxies['http'] = http
         if https: proxies['https'] = https
         return proxies or None
@@ -380,73 +383,3 @@ def fetch_order_by_clordid(instId: str, clOrdId: str) -> Dict[str, Any]:
     jd = _req("GET", "/api/v5/trade/order", params={"instId": instId, "clOrdId": clOrdId}, private=True)
     arr = jd.get("data", []) if isinstance(jd, dict) else []
     return arr[0] if arr else {}
-
-
-
-def _make_clordid(instId: str, side: str, px, sz, tag: str | None) -> str | None:
-    """Unique but short. Keep <=32 chars for OKX."""
-    try:
-        global _CL_COUNTER
-        _CL_COUNTER = (_CL_COUNTER + 1) % (36**6)  # rolling counter
-        base = f"{instId}|{side}|{px}|{sz}|{tag}|{SEED_HEX}"
-        h = hashlib.sha1(base.encode()).hexdigest()[:16]  # 16 hex
-        suf = _b36(_CL_COUNTER, 6)                        # 6 chars
-        return f"G{h}{suf}".upper()                      # len=23
-    except Exception:
-        return None
-
-
-
-
-def place_limit(instId: str, side: str, sz: Decimal, px: Decimal,
-                post_only: bool = True, reduce_only: bool = False, tag: str | None = None,
-                posSide: str | None = None, td_mode: str | None = None) -> str:
-    def _try_once(new_id: bool):
-        clid = _make_clordid(instId, side, px, sz, tag) if new_id else clid0
-        body = {
-            "instId": instId, "tdMode": (td_mode or TD_MODE_DEFAULT),
-            "side": side, "posSide": (posSide or _posSide_from_side(side)),
-            "ordType": "post_only" if post_only else "limit",
-            "px": str(px), "sz": str(sz), "tag": tag,
-            "clOrdId": clid, "reduceOnly": "true" if reduce_only else "false",
-        }
-        jd = _req("POST", "/api/v5/trade/order", body=body, private=True)
-        data = jd.get("data", []) if isinstance(jd, dict) else []
-        if data and data[0].get("ordId"):
-            return data[0]["ordId"]
-        od = fetch_order_by_clordid(instId, clid)
-        st = str(od.get("state", "")).lower()
-        if od.get("ordId") and st not in {"canceled", "filled"}:
-            return od.get("ordId", "")
-        return ""
-
-    clid0 = _make_clordid(instId, side, px, sz, tag)
-    return _try_once(False) or _try_once(True)
-
-
-
-
-def place_market(instId: str, side: str, sz: Decimal,
-                 reduce_only: bool = False, tag: str | None = None,
-                 posSide: str | None = None, td_mode: str | None = None) -> str:
-    def _try_once(new_id: bool):
-        clid = _make_clordid(instId, side, "MKT", sz, tag) if new_id else clid0
-        body = {
-            "instId": instId, "tdMode": (td_mode or TD_MODE_DEFAULT),
-            "side": side, "posSide": (posSide or _posSide_from_side(side)),
-            "ordType": "market", "sz": str(sz), "tag": tag, "clOrdId": clid,
-            "reduceOnly": "true" if reduce_only else "false",
-        }
-        jd = _req("POST", "/api/v5/trade/order", body=body, private=True)
-        data = jd.get("data", []) if isinstance(jd, dict) else []
-        if data and data[0].get("ordId"):
-            return data[0]["ordId"]
-        od = fetch_order_by_clordid(instId, clid)
-        st = str(od.get("state", "")).lower()
-        if od.get("ordId") and st not in {"canceled", "filled"}:
-            return od.get("ordId", "")
-        return ""
-
-    clid0 = _make_clordid(instId, side, "MKT", sz, tag)
-    return _try_once(False) or _try_once(True)
-
