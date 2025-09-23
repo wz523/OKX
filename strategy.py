@@ -297,12 +297,16 @@ class Strategy:
                 # 信号满足：价格与指标共振且量能共振
                 if side == "long":
                     # 仅当多头持仓>0 且浮盈>0 才允许趋势加仓
-                    if not (_lp > 0 and _lu > 0):
+                    if getattr(cfg, 'TREND_REQUIRE_PROFIT', True):
+                        if not (_lp > 0 and _lu > 0):
+                            continue
                         continue
                     want = bool(sig.get("bull") and sig.get("vol_bull"))
                 else:
                     # 仅当空头持仓>0 且浮盈>0 才允许趋势加仓
+                    if getattr(cfg, 'TREND_REQUIRE_PROFIT', True):
                     if not (_sp > 0 and _su > 0):
+                        continue
                         continue
                     want = bool(sig.get("bear") and sig.get("vol_bear"))
                 if not want:

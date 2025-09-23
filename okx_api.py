@@ -49,16 +49,6 @@ def _b36(n: int, width: int = 6) -> str:
     return "".join(reversed(out))
 
 
-def _make_clordid(instId: str, side: str, px, sz, tag: str | None) -> str | None:
-    """Deterministic idempotency key. Max 32 chars for OKX clOrdId."""
-    try:
-        key = f"{instId}|{side}|{px}|{sz}|{tag}|{SEED_HEX}"
-        h = hashlib.sha1(key.encode()).hexdigest()[:20]
-        return f"G{h}".upper()
-    except Exception:
-        return None
-
-
 
 # ---- auto-load .env (project root / module dir / parent) ----
 try:
@@ -171,16 +161,19 @@ def _req(method: str, path: str, params: Dict[str, Any] | None = None, body: Dic
     for _ in range(3):
         try:
             if method.upper() == "GET":
-                r = SESSION.get(url, params=params, headers=headers, timeout=TIMEOUT)
+                r = SESSION.get(url, params=params, headers=headers, timeout=TIMEOUT, proxies=_get_proxies(url))
             else:
-                r = SESSION.post(url, params=params, data=body_str.encode(), headers=headers, timeout=TIMEOUT)
+                r = SESSION.post(url, params=params, data=body_str.encode(), headers=headers, timeout=TIMEOUT, proxies=_get_proxies(url))
             if r.status_code // 100 != 2:
                 raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
             jd = r.json()
             if jd.get("code") not in ("0", 0, None):
                 data = jd.get('data') or []
                 detail = '; '.join([f"{x.get('sCode') or x.get('code')}: {x.get('sMsg') or x.get('msg')}" for x in data][:3])
-                raise RuntimeError(f"OKX错误: code={jd.get('code')} msg={jd.get('msg')} details=[{detail}]")
+            # Special-case: order not exist when querying by clOrdId
+            if str(jd.get("code")) == "51603" and path == "/api/v5/trade/order":
+                return {}
+            raise RuntimeError(f"OKX错误: code={jd.get('code')} msg={jd.get('msg')} details=[{detail}]")
             return jd
         except Exception as e:
             err = str(e)
@@ -190,6 +183,21 @@ def _req(method: str, path: str, params: Dict[str, Any] | None = None, body: Dic
     return {}
 
 
+
+
+def fetch_price_limit(instId: str) -> dict:
+    """Get OKX price limit band for the instrument. Return {'maxBuy': Decimal, 'minSell': Decimal}."""
+    jd = _req("GET", "/api/v5/public/price-limit", params={"instId": instId})
+    try:
+        arr = jd.get("data", [])
+        d = arr[0] if arr else {}
+        max_buy = d.get("buyLmt") or d.get("maxBuy") or d.get("highest")
+        min_sell = d.get("sellLmt") or d.get("minSell") or d.get("lowest")
+        from decimal import Decimal
+        return {"maxBuy": Decimal(str(max_buy or "0")), "minSell": Decimal(str(min_sell or "0"))}
+    except Exception:
+        from decimal import Decimal
+        return {"maxBuy": Decimal("0"), "minSell": Decimal("0")}
 # ========== 公共接口 ==========
 
 def fetch_instrument(instId: str) -> Dict[str, str]:
@@ -288,6 +296,18 @@ def place_market(instId: str, side: str, sz: Decimal,
     }
     if body.get("clOrdId") is None:
         body.pop("clOrdId", None)
+    # clamp to price band to avoid 51006
+    try:
+        band = fetch_price_limit(instId)
+        if str(side).lower() == "buy" and band.get("maxBuy"):
+            if px > band["maxBuy"]:
+                px = band["maxBuy"]
+        if str(side).lower() == "sell" and band.get("minSell"):
+            if px < band["minSell"]:
+                px = band["minSell"]
+    except Exception:
+        pass
+
     try:
         jd = _req("POST", "/api/v5/trade/order", body=body, private=True)
         data = jd.get("data", [])

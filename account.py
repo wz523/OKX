@@ -135,9 +135,16 @@ class Account:
             except Exception:
                 pass
 
-        return place_limit(self.inst, side, sz, px_adj,
-                           post_only=getattr(cfg, "POST_ONLY", True),
-                           reduce_only=reduce_only, td_mode=self.td_mode, tag=tag, posSide=posSide)
+        try:
+            return place_limit(self.inst, side, sz, px_adj,
+                               post_only=getattr(cfg, "POST_ONLY", True),
+                               reduce_only=reduce_only, td_mode=self.td_mode, tag=tag, posSide=posSide)
+        except Exception as e:
+            msg = str(e)
+            if ("51006" in msg or "price limit" in msg.lower()) and bool(getattr(cfg, "ALLOW_TAKER_ON_BAND", True)):
+                # 波动期落入价带之外，允许降级为市价吃单，以保留网格连续性
+                return place_market(self.inst, side, sz, reduce_only=reduce_only, td_mode=self.td_mode, tag=tag, posSide=posSide)
+            raise
 
     def cancel_orders_by_tag_and_side(self, tag_sub: str, posSide: str) -> int:
         """按标签+方向撤单"""
